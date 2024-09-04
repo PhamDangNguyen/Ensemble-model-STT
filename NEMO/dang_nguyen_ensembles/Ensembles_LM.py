@@ -17,13 +17,25 @@ from nemo.collections.asr.parts.submodules import ctc_beam_decoding
 from nemo.collections.asr.parts.utils.transcribe_utils import TextProcessingConfig
 from nemo.collections.asr.models import EncDecCTCModelBPE
 from nemo.utils import logging
-import nemo.collections.asr as nemo_asr
-import soundfile as sf
 from segments import Segment
 import tempfile
 import json
 from tqdm import tqdm
 import os
+from nemo_text_processing.inverse_text_normalization.inverse_normalize import InverseNormalizer
+from fastpunct import FastPunct
+
+eng_itn = InverseNormalizer("lower_cased","en")
+vie_itn = InverseNormalizer("lower_cased","vi")
+eng_res = FastPunct("english")
+
+def ITN_text(text, language):
+    if language == "en":
+        itn_text = eng_itn.inverse_normalize(text, verbose=False)
+        res_text = eng_res.punct([itn_text], correct=True)
+        return res_text
+    else:
+        return vie_itn.inverse_normalize(text, verbose=False)
 
 @dataclass
 class EvalBeamSearchNGramConfig:
@@ -66,6 +78,7 @@ class EvalBeamSearchNGramConfig:
         do_lowercase = False,
         rm_punctuation = False,
     ))
+
 
 class FastConformerASR(EncDecCTCModelBPE):
 
@@ -258,7 +271,7 @@ class FastConformerWithLM:
             timesteps, _, probs_batch = output_fromModel[index].timestep,output_fromModel[index].timestep,[output_fromModel[index].y_sequence]
             # print(len(timesteps["word"]))
             # print(len(output.word_confidence))
-            raw_segments = [Segment(w["word"], w["start_offset"], w["end_offset"],output.word_confidence[i]) for i,w in enumerate(timesteps["word"])]
+            raw_segments = [Segment(w["word"], w["start_offset"], w["end_offset"]) for i,w in enumerate(timesteps["word"])]
             raw_segments = [seg for seg in raw_segments if seg.word != ""]
             self._enable_beamsearch()
             probs_lens = torch.tensor([prob.shape[0] for prob in probs_batch])
@@ -275,9 +288,13 @@ class FastConformerWithLM:
             kenlm_text = beams_batch[0][0].text
             outputs_text.append([raw_segments,kenlm_text])
         return outputs_text  
-################################################################################################################################################################################
 
 class Infer_ASR(ConfidenceEnsembleModel):
+    """
+    Ensemble: 
+        model 0: English
+        model 1: Vietnamese
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -334,22 +351,27 @@ class Infer_ASR(ConfidenceEnsembleModel):
         # transposing with zip(*list)
         features = np.array(list(zip(*confidences)))
         model_indices = self.model_selection_block.predict(features)
+        print(model_indices)
         for audio_index, model_index in enumerate(model_indices):
-            final_transcriptions.append(model_results[f"model_{model_index}"][audio_index])
-
+            if model_index == 0:
+                invert_text_norm = ITN_text(model_results[f"model_{model_index}"][audio_index], "en")#lay transcript en => ITN en
+            else:
+                invert_text_norm = ITN_text(model_results[f"model_{model_index}"][audio_index], "vi")#lay transcript vietnamese => ITN vi
+            final_transcriptions.append(invert_text_norm)
         return final_transcriptions
  
-    
 if __name__ == '__main__':
     model_nemo = "/home/pdnguyen/Ensemble_confidence_Nemo/Ensemble-model-STT/NEMO/dang_nguyen_ensembles/models/Ensemble/Ensemble_E_fubong.nemo"
-    KenLM_path = ["/home/pdnguyen/Ensemble_confidence_Nemo/Ensemble-model-STT/NEMO/dang_nguyen_ensembles/models/kenLM/model_fubong_23_8_2024_English_4","/home/pdnguyen/fast_confomer_finetun/train_kenLM/scripts/asr_language_modeling/kenLM_output/model_fubong_23_8_2024_5"]
+    KenLM_path = [
+                    "/home/pdnguyen/Ensemble_confidence_Nemo/Ensemble-model-STT/NEMO/dang_nguyen_ensembles/models/kenLM/model_fubong_23_8_2024_English_4",
+                    "/home/pdnguyen/fast_confomer_finetun/train_kenLM/scripts/asr_language_modeling/kenLM_output/model_fubong_23_8_2024_5"
+                ]
     
     model = Infer_ASR.restore_from(model_nemo, map_location=torch.device("cuda"))
 
     text_infer = model.customer_transcribe(
         paths2audio_files=["/home/pdnguyen/fast_confomer_finetun/finetune-fast-conformer/infer_N/fubong/20240222164216_giọng nữ miền Bắc 1/chunk_13_normalized.wav",
-                "/home/pdnguyen/Ensemble_confidence_Nemo/English_data/3.wav",
-                "/mnt/driver/pdnguyen/studen_annoted/data_telesale_extract_10_dir/data_tele_1/notannoted/group_1/92.wav"
+                "/home/pdnguyen/Ensemble_confidence_Nemo/English_data/3.wav"
                 ],
         Lm_path=KenLM_path,
         batch_size=2,

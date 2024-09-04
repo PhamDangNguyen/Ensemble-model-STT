@@ -45,6 +45,11 @@ confidence:
 ### Bug trong quá trình training
 Nếu xuất hiện lỗi ```TypeError: ConfidenceConfig.__init__() got an unexpected keyword argument 'measure_cfg``` thì có nghĩa là version Nemo khi training model của bạn không giống với version Nemo khi ensemble. Lúc này chỉ cần sử dụng file code ```convert_model_replace_meansure_by_method.py``` để thay thế "measure_cfg" thành "method_cfg" và Overwrite lại model là được.
 
+#### Bị treo khi infer model:
+Nguyên nhân: Pip thêm thư viện => Thư viện cũ của nemo bị overwrite
+![alt text](image-1.png)
+Giải quyết:
+![alt text](image-2.png)
 ## Infer Ensemble
 Note: Ở version 1.0 sẽ chỉ cho phép infer theo path model thay vì infer trực tiếp theo signal audio.
 ### Infer without LM
