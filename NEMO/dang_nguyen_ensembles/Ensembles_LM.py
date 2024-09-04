@@ -36,7 +36,6 @@ def ITN_text(text, language):
         return res_text
     else:
         return vie_itn.inverse_normalize(text, verbose=False)
-
 @dataclass
 class EvalBeamSearchNGramConfig:
     """
