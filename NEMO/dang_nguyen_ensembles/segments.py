@@ -3,16 +3,15 @@ from functools import lru_cache
 
 class Segment:
 
-    def __init__(self, word, start, end,confidence,model_stride=8, window_stride=0.01):
+    def __init__(self, word, start, end,model_stride=8, window_stride=0.01):
         self.word = word
         self._start = start
         self._end = end
         self.model_stride = model_stride
-        self.confidence = confidence
         self.window_stride = window_stride
 
     def __repr__(self):
-        return f"Segment({self.word}, start:{self.start:.2f}, end:{self.end:.2f}, confidence:{self.confidence:.2f})"
+        return f"Segment({self.word}, start:{self.start:.2f}, end:{self.end:.2f})"
 
     @property
     @lru_cache
