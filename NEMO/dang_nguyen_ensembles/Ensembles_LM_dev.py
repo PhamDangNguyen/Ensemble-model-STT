@@ -24,6 +24,7 @@ from tqdm import tqdm
 import os
 from nemo_text_processing.inverse_text_normalization.inverse_normalize import InverseNormalizer
 from fastpunct import FastPunct
+import soundfile as sf
 
 eng_itn = InverseNormalizer("lower_cased","en")
 vie_itn = InverseNormalizer("lower_cased","vi")
@@ -33,9 +34,54 @@ def ITN_text(text, language):
     if language == "en":
         itn_text = eng_itn.inverse_normalize(text, verbose=False)
         res_text = eng_res.punct([itn_text], correct=True)
-        return res_text
+        return res_text[0]
     else:
         return vie_itn.inverse_normalize(text, verbose=False)
+    
+class SignalAudio:
+    def __init__(self, input_signals: List[np.ndarray], return_sample_id: bool=False):
+        self.input_signals = input_signals
+        self.return_sample_id = return_sample_id
+        
+    def __getitem__(self, index):
+        sample = self.input_signals[index]
+        if isinstance(sample, np.ndarray):
+            audio_tensor = torch.tensor(sample, dtype=torch.float32)
+        else:
+            raise TypeError(f"Expected np.ndarray, but got {type(sample)}")
+        audio_tensor = torch.tensor(sample, dtype=torch.float32)
+        audio_length = torch.tensor(audio_tensor.shape[0], dtype=torch.long)
+        labels_tensor = torch.tensor([], dtype=torch.int64)
+        info_tensor = torch.tensor(0, dtype=torch.long)
+        # Kiểm tra kiểu dữ liệu của sample
+
+        if isinstance(sample, np.ndarray):
+            audio_tensor = torch.tensor(sample, dtype=torch.float32)
+        else:
+            raise TypeError(f"Expected np.ndarray, but got {type(sample)}")
+    
+        if self.return_sample_id:
+            output = audio_tensor, audio_length, labels_tensor, info_tensor, index
+        else:
+            output = audio_tensor, audio_length, labels_tensor, info_tensor
+        return output
+
+    def __len__(self):
+        return len(self.input_signals)
+    
+    def collate_fn(self,batch):
+        # Lấy chiều dài lớn nhất của audio trong batch
+        max_len = max([x[0].shape[0] for x in batch])
+        # Padding tất cả các audio tensor đến cùng chiều dài
+        padded_audio = []
+        for item in batch:
+            audio_tensor, audio_length, labels_tensor, info_tensor, index = item
+            padding = max_len - audio_tensor.shape[0]
+            padded_audio_tensor = torch.nn.functional.pad(audio_tensor, (0, padding))
+            padded_audio.append((padded_audio_tensor, audio_length, labels_tensor, info_tensor, index))
+        return torch.utils.data.dataloader.default_collate(padded_audio)
+
+
 @dataclass
 class EvalBeamSearchNGramConfig:
     """
@@ -87,13 +133,11 @@ class FastConformerASR(EncDecCTCModelBPE):
     @torch.no_grad()
     def transcribe(
         self,
-        paths2audio_files: List[str],
+        input_signal: List[np.ndarray],
         batch_size: int = 4,
         logprobs: bool = False,
         return_hypotheses: bool = False,
         num_workers: int = 0,
-        channel_selector: Optional[ChannelSelectorType] = None,
-        augmentor: DictConfig = None,
         verbose: bool = True,
     ) -> List[str]:
         """
@@ -118,7 +162,7 @@ class FastConformerASR(EncDecCTCModelBPE):
         Returns:
             A list of transcriptions (or raw log probabilities if logprobs is True) in the same order as paths2audio_files
         """
-        if paths2audio_files is None or len(paths2audio_files) == 0:
+        if input_signal is None or len(input_signal)==0:
             return {}
 
         if return_hypotheses and logprobs:
@@ -131,7 +175,6 @@ class FastConformerASR(EncDecCTCModelBPE):
             num_workers = min(batch_size, os.cpu_count() - 1)
         # We will store transcriptions here
         hypotheses = []
-        all_hypotheses = []
         # Model's mode and device
         mode = self.training
         device = next(self.parameters()).device
@@ -141,6 +184,7 @@ class FastConformerASR(EncDecCTCModelBPE):
         try:
             self.preprocessor.featurizer.dither = 0.0
             self.preprocessor.featurizer.pad_to = 0
+            # Switch model to evaluation mode
             self.eval()
             # Freeze the encoder and decoder modules
             self.encoder.freeze()
@@ -149,23 +193,15 @@ class FastConformerASR(EncDecCTCModelBPE):
             logging.set_verbosity(logging.WARNING)
             # Work in tmp directory - will store manifest file there
             with tempfile.TemporaryDirectory() as tmpdir:
-                with open(os.path.join(tmpdir, 'manifest.json'), 'w', encoding='utf-8') as fp:
-                    for audio_file in paths2audio_files:
-                        entry = {'audio_filepath': audio_file, 'duration': 100000, 'text': ''}
-                        fp.write(json.dumps(entry) + '\n')
+                signal_audio = SignalAudio(input_signals=input_signal, return_sample_id=True)
+                temporary_datalayer = torch.utils.torch.utils.data.DataLoader(
+                    dataset=signal_audio,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers= num_workers if num_workers is not None else min(batch_size, os.cpu_count() - 1),
+                    collate_fn= signal_audio.collate_fn
+                )
 
-                config = {
-                    'paths2audio_files': paths2audio_files,
-                    'batch_size': batch_size,
-                    'temp_dir': tmpdir,
-                    'num_workers': num_workers,
-                    'channel_selector': channel_selector,
-                }
-
-                if augmentor:
-                    config['augmentor'] = augmentor
-
-                temporary_datalayer = self._setup_transcribe_dataloader(config)
                 for test_batch in tqdm(temporary_datalayer, desc="Transcribing", disable=not verbose):
                     logits, logits_len, greedy_predictions = self.forward(
                         input_signal=test_batch[0].to(device), input_signal_length=test_batch[1].to(device)
@@ -195,6 +231,7 @@ class FastConformerASR(EncDecCTCModelBPE):
                     del logits
                     del test_batch
         finally:
+            # set mode back to its original value
             self.train(mode=mode)
             self.preprocessor.featurizer.dither = dither_value
             self.preprocessor.featurizer.pad_to = pad_to_value
@@ -202,7 +239,8 @@ class FastConformerASR(EncDecCTCModelBPE):
                 self.encoder.unfreeze()
                 self.decoder.unfreeze()
             logging.set_verbosity(logging_level)
-        return hypotheses,probs
+        # print(hypotheses)
+        return hypotheses
 
 class FastConformerWithLM:
 
@@ -259,9 +297,9 @@ class FastConformerWithLM:
         self.asr_model.change_decoding_strategy(decoding_cfg)
         self._enable_logging()    
       
-    def transcribe_ensemble(self, audio_file: str,batch_size=3,return_hypotheses=None):
+    def transcribe_ensemble(self, input_signal: List[np.ndarray],batch_size=3,return_hypotheses=None):
         self._enable_preserve_alignments()
-        outputs= self.asr_model.transcribe(audio_file,return_hypotheses=return_hypotheses,batch_size=batch_size)
+        outputs= self.asr_model.transcribe(input_signal, return_hypotheses=return_hypotheses, batch_size=batch_size)
         return outputs
     
     def get_results_beamSearch(self,output_fromModel):
@@ -300,7 +338,7 @@ class Infer_ASR(ConfidenceEnsembleModel):
     @torch.no_grad()
     def customer_transcribe(
         self,
-        paths2audio_files: List[str],
+        input_signal: List[np.ndarray],
         batch_size: int = 4,
         Lm_path = None,
         return_hypotheses = False
@@ -333,7 +371,7 @@ class Infer_ASR(ConfidenceEnsembleModel):
             cfg.nemo_model_file = model
             cfg.kenlm_model_file = Lm_path[model_idx]
             fast_conformer = FastConformerWithLM(cfg=cfg, beam_alpha=0.5, beam_beta=2.0, beam_width=64) 
-            transcriptions = fast_conformer.transcribe_ensemble(audio_file=paths2audio_files,batch_size=batch_size,return_hypotheses=return_hypotheses)
+            transcriptions = fast_conformer.transcribe_ensemble(input_signal=input_signal, batch_size=batch_size, return_hypotheses=return_hypotheses)
             beam_search_results = fast_conformer.get_results_beamSearch(transcriptions)
 
             for beam_search_result in beam_search_results:
@@ -368,13 +406,16 @@ if __name__ == '__main__':
     
     model = Infer_ASR.restore_from(model_nemo, map_location=torch.device("cuda"))
 
+    array_audio_1, sample_rate = sf.read("/home/pdnguyen/Ensemble_confidence_Nemo/English_data/3.wav")
+    array_audio_2, sample_rate = sf.read("/home/pdnguyen/Ensemble_confidence_Nemo/English_data/4.wav")
+    array_audio_3, sample_rate = sf.read("/home/pdnguyen/Ensemble_confidence_Nemo/English_data/5.wav")
+    array_audio_4, sample_rate = sf.read("/mnt/driver/pdnguyen/data_record/Audio_boss_chinh/chunk_2.wav")
+    array_audio_5, sample_rate = sf.read("/mnt/driver/pdnguyen/data_record/Audio_boss_chinh/chunk_3.wav")
+
     text_infer = model.customer_transcribe(
-        paths2audio_files=["/home/pdnguyen/fast_confomer_finetun/finetune-fast-conformer/infer_N/fubong/20240222164216_giọng nữ miền Bắc 1/chunk_13_normalized.wav",
-                "/home/pdnguyen/Ensemble_confidence_Nemo/English_data/3.wav"
-                ],
-        Lm_path=KenLM_path,
-        batch_size=2,
-        return_hypotheses=True,
+    input_signal= [array_audio_1, array_audio_2, array_audio_3, array_audio_4, array_audio_5],
+    Lm_path=KenLM_path,
+    batch_size=2,
+    return_hypotheses=True,
     )
     print(text_infer)
-
